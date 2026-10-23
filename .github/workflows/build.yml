@@ -18,10 +18,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: stable
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
       - uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -43,16 +44,16 @@ jobs:
   bundle:
     needs: test
     if: startsWith(github.ref, 'refs/tags/v')
-    permissions:
-      contents: write
     strategy:
       matrix:
         os: [ubuntu-22.04, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
       - uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -116,9 +117,15 @@ jobs:
             echo "Verify downloads with \`SHA256SUMS.txt\`. Licensed under AGPL-3.0-only."
           } >> notes.md
           cat notes.md
-      - uses: softprops/action-gh-release@v2.0.8
-        with:
-          name: Panoptic ${{ github.ref_name }}
-          body_path: notes.md
-          files: assets/*
-          fail_on_unmatched_files: true
+      # First-party GitHub CLI (preinstalled on runners); no third-party action
+      # receives the write token.
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" assets/* --clobber
+            gh release edit "$GITHUB_REF_NAME" --title "Panoptic $GITHUB_REF_NAME" --notes-file notes.md
+          else
+            gh release create "$GITHUB_REF_NAME" assets/* --title "Panoptic $GITHUB_REF_NAME" --notes-file notes.md --verify-tag
+          fi
