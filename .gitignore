@@ -1,0 +1,9 @@
+/target
+node_modules/
+ui/dist/
+src-tauri/gen/
+src-tauri/binaries/
+scan-elevated.*
+src-tauri/target/
+*.log
+.DS_Store

@@ -1,0 +1,36 @@
+name: False positive
+description: A finding fired on something legitimate
+labels: [false-positive, detection]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        False-positive reports directly improve detection quality. Thank you!
+  - type: input
+    id: finding
+    attributes:
+      label: Finding ID and title
+      placeholder: "persistence-af163a6e766e1e53 · Suspicious print-monitor persistence"
+    validations:
+      required: true
+  - type: textarea
+    id: json
+    attributes:
+      label: Finding JSON
+      description: In the app, expand the finding and use Copy → JSON. Redact anything sensitive.
+      render: json
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why is this legitimate?
+      description: Vendor/product, how it was installed, and how you verified it.
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system and version
+    validations:
+      required: true

@@ -1,0 +1,20 @@
+name: Feature or detection request
+description: Suggest a new capability, detection or integration
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: For detections, include the ATT&CK technique, platforms, and how to tell malicious from benign.
+  - type: textarea
+    id: references
+    attributes:
+      label: References
+      description: Threat reports, documentation, prior art.

@@ -1,0 +1,17 @@
+[package]
+name = "panoptic-cli"
+description = "Headless Panoptic scanner for servers, cron jobs and incident response"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "panoptic-cli"
+path = "src/main.rs"
+
+[dependencies]
+panoptic-core.workspace = true
+serde_json.workspace = true
+clap = { version = "4.5", features = ["derive"] }

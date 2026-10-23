@@ -1,0 +1,201 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * Panoptic "Ink & Beacon" design tokens (RGB triplets so Tailwind opacity
+ * modifiers work).
+ *   brand  : the beacon — interactive accents, the lit cell, focus rings
+ *   cta    : primary buttons (lime on ink in dark mode, ink with lime text in light)
+ *   accent : teal "verified" signal
+ */
+:root,
+[data-theme='light'] {
+  color-scheme: light;
+  --bg: 245 246 241;
+  --surface: 255 255 255;
+  --raised: 238 240 233;
+  --line: 222 225 215;
+  --fg: 14 17 24;
+  --muted: 82 89 102;
+  --subtle: 134 141 153;
+  --brand: 77 124 15;
+  --brand-fg: 255 255 255;
+  --cta: 14 17 24;
+  --cta-fg: 200 241 53;
+  --accent: 13 148 136;
+  --danger: 220 38 64;
+  --warn: 217 108 6;
+  --caution: 180 130 4;
+  --info: 37 99 235;
+  --ok: 13 148 136;
+  --ink: 9 11 16;
+  --cell: 217 221 210;
+}
+
+[data-theme='dark'] {
+  color-scheme: dark;
+  --bg: 9 11 16;
+  --surface: 15 18 25;
+  --raised: 22 26 35;
+  --line: 35 40 53;
+  --fg: 233 236 242;
+  --muted: 148 156 176;
+  --subtle: 98 106 126;
+  --brand: 200 241 53;
+  --brand-fg: 10 13 20;
+  --cta: 200 241 53;
+  --cta-fg: 10 13 20;
+  --accent: 45 226 197;
+  --danger: 255 77 94;
+  --warn: 255 159 67;
+  --caution: 250 204 21;
+  --info: 96 165 250;
+  --ok: 45 226 197;
+  --ink: 9 11 16;
+  --cell: 43 51 70;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  @apply bg-bg font-sans text-fg antialiased;
+  font-size: 13.5px;
+  font-feature-settings: 'cv11', 'ss01';
+}
+
+h1,
+h2,
+h3,
+.font-display {
+  font-family: 'Space Grotesk Variable', 'Space Grotesk', 'Inter Variable', system-ui, sans-serif;
+  letter-spacing: -0.01em;
+}
+
+::selection {
+  @apply bg-brand/30;
+}
+
+:focus-visible {
+  @apply outline-none ring-2 ring-brand/70 ring-offset-1 ring-offset-bg;
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgb(var(--line)) transparent;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+@layer components {
+  .card {
+    @apply rounded-xl border border-line bg-surface shadow-card;
+  }
+  .card-flat {
+    @apply rounded-xl border border-line bg-surface;
+  }
+  .btn {
+    @apply inline-flex select-none items-center justify-center gap-2 whitespace-nowrap rounded-lg px-3.5 py-2 text-[13px] font-medium transition disabled:cursor-not-allowed disabled:opacity-40;
+  }
+  .btn-primary {
+    @apply btn bg-cta font-semibold text-cta-fg shadow-sm hover:bg-cta/90 active:bg-cta/80;
+  }
+  .btn-secondary {
+    @apply btn border border-line bg-surface text-fg hover:bg-raised;
+  }
+  .btn-ghost {
+    @apply btn text-muted hover:bg-raised hover:text-fg;
+  }
+  .btn-danger {
+    @apply btn bg-danger text-white hover:bg-danger/90;
+  }
+  .btn-sm {
+    @apply px-2.5 py-1.5 text-xs;
+  }
+  .input {
+    @apply rounded-lg border border-line bg-surface px-3 py-2 text-[13px] text-fg placeholder:text-subtle focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20;
+  }
+  .label {
+    @apply mb-1.5 block text-xs font-medium text-muted;
+  }
+  .th {
+    @apply sticky top-0 z-10 select-none whitespace-nowrap border-b border-line bg-surface px-4 py-2.5 text-start text-[11px] font-semibold uppercase tracking-wide text-subtle;
+  }
+  .td {
+    @apply border-b border-line/60 px-4 py-2.5 align-top;
+  }
+  .chip {
+    @apply inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10.5px] font-semibold uppercase tracking-wide;
+  }
+  .kbd {
+    @apply rounded border border-line bg-raised px-1.5 py-0.5 font-mono text-[10px] text-muted;
+  }
+  .eyebrow {
+    @apply font-display text-[11px] font-semibold uppercase tracking-[0.14em] text-subtle;
+  }
+  .wordmark {
+    @apply font-display font-bold uppercase tracking-[0.22em];
+  }
+  .mono {
+    @apply font-mono text-[12px];
+  }
+}
+
+@keyframes sweep {
+  0% {
+    transform: translateX(-120%);
+  }
+  100% {
+    transform: translateX(420%);
+  }
+}
+.sweep {
+  animation: sweep 1.6s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+[dir='rtl'] .sweep {
+  animation-direction: reverse;
+}
+
+/* Watchtower: the sightline rotates around the tower while a scan runs. */
+@keyframes watch {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.watching {
+  transform-origin: 32px 32px;
+  animation: watch 2.4s linear infinite;
+}
+
+/* Cells light up one after another (gauge entrance). */
+@keyframes cell-on {
+  from {
+    opacity: 0;
+    transform: scale(0.92);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.cell-on {
+  transform-origin: center;
+  transform-box: fill-box;
+  animation: cell-on 420ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+/* Soft beacon glow used behind hero marks. */
+.beacon-glow {
+  background: radial-gradient(closest-side, rgb(var(--brand) / 0.22), rgb(var(--accent) / 0.06) 55%, transparent);
+}

@@ -1,0 +1,45 @@
+name: Bug report
+description: Something is broken or behaves unexpectedly
+labels: [bug, triage]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! **Security vulnerabilities must be reported privately**: see SECURITY.md.
+  - type: input
+    id: version
+    attributes:
+      label: Panoptic version
+      placeholder: "0.1.0"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system and version
+      placeholder: "Windows 11 24H2 / Ubuntu 24.04"
+    validations:
+      required: true
+  - type: dropdown
+    id: privileges
+    attributes:
+      label: Privileges
+      options: [Administrator / root, Standard user]
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output
+      description: CLI output or the scan stage messages from the Overview page. Redact hostnames and paths if needed.
+      render: text

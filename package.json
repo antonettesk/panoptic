@@ -1,0 +1,24 @@
+{
+  "name": "panoptic-workspace",
+  "private": true,
+  "version": "0.1.0",
+  "license": "AGPL-3.0-only",
+  "workspaces": [
+    "ui"
+  ],
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "ui:dev": "node scripts/prepare-sidecar.mjs --debug && npm run dev -w ui",
+    "ui:build": "node scripts/prepare-sidecar.mjs && npm run build -w ui",
+    "sidecar": "node scripts/prepare-sidecar.mjs",
+    "pretest": "node scripts/prepare-sidecar.mjs --debug",
+    "test": "cargo test --workspace && npm run test -w ui",
+    "prelint": "node scripts/prepare-sidecar.mjs --debug",
+    "lint": "cargo clippy --workspace --all-targets -- -D warnings && npm run typecheck -w ui"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.1.0"
+  }
+}

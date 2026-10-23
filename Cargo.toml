@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = ["crates/panoptic-core", "crates/panoptic-cli", "src-tauri"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Panoptic Core Team"]
+license = "AGPL-3.0-only"
+rust-version = "1.77"
+
+[workspace.dependencies]
+panoptic-core = { path = "crates/panoptic-core" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "unwind"
+strip = true
