@@ -1701,10 +1701,12 @@ fn lnk_target(p: &Path) -> Option<String> {
     // Shortcuts are attacker-controllable: cap the read and bounds-check
     // every offset taken from the file so a crafted .lnk cannot panic the scan.
     const MAX_LNK: u64 = 1 << 20;
-    if std::fs::metadata(p).ok()?.len() > MAX_LNK {
+    // Single open, capped read: no gap between a size check and the read.
+    let mut b = Vec::new();
+    std::io::Read::read_to_end(&mut std::io::Read::take(std::fs::File::open(p).ok()?, MAX_LNK + 1), &mut b).ok()?;
+    if b.len() as u64 > MAX_LNK {
         return None;
     }
-    let b = std::fs::read(p).ok()?;
     if b.len() < 0x4C || rd_u32(&b, 0) != 0x4C {
         return None;
     }

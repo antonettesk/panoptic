@@ -1064,56 +1064,130 @@ pub(crate) fn suspicious_mappings(maps: &str) -> Vec<String> {
 // ---------------------------------------------------------------------------
 // Persistence helpers
 
-/// Read an autostart/config file safely while running as root.
-///
-/// Many of these files live in user-writable places (home directories,
-/// spool dirs). A user could plant a symlink or hard link there pointing at
-/// a secret (e.g. `/etc/shadow`) and have root copy its lines into a report.
-/// So:
-///  * the file is opened with `O_NOFOLLOW` (no TOCTOU between check and read);
-///  * a symlink is followed only when the link itself is root-owned — users
-///    cannot create those, while systemd/etc use them legitimately;
-///  * a root-owned regular file with extra hard links is refused;
-///  * reads are capped at 1 MiB.
-pub(crate) fn read_config(path: &Path) -> Option<String> {
-    use std::io::Read;
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    const MAX: u64 = 1 << 20;
-    // A directory symlink earlier in the path (e.g. ~/.ssh -> /root/.ssh)
-    // would escape the user's area even though the final component is a
-    // regular file. Require the fully resolved path to stay inside the
-    // user-writable root it was enumerated from (e.g. /home/alice).
-    if is_user_writable_location(path) {
-        let anchor: PathBuf = path.components().take(if path.starts_with("/home/") || path.starts_with("/run/user/") { 3 } else { 2 }).collect();
-        let resolved = fs::canonicalize(path).ok()?;
-        if !resolved.starts_with(&anchor) {
-            return None;
-        }
-    }
-    let open_nofollow = |p: &Path| fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(p);
-    let file = match open_nofollow(path) {
-        Ok(f) => f,
-        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
-            let link = fs::symlink_metadata(path).ok()?;
-            if link.uid() != 0 {
-                return None; // user-planted symlink: never follow as root
-            }
-            fs::File::open(path).ok()?
-        }
-        Err(_) => return None,
-    };
-    let meta = file.metadata().ok()?;
-    if !meta.is_file() || meta.len() > MAX || (meta.uid() == 0 && meta.nlink() > 1 && is_user_writable_location(path)) {
-        return None;
-    }
-    let mut s = String::new();
-    file.take(MAX).read_to_string(&mut s).ok()?;
-    Some(s)
+/// Trust level of the directory chain walked so far.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Area {
+    /// Every directory so far is root-owned and not group/world-writable.
+    Trusted,
+    /// Some directory is controlled by an unprivileged user (`owner`) or is
+    /// shared-writable (`owner: None`, e.g. /tmp or a cron spool).
+    User { owner: Option<u32> },
 }
 
-/// Locations where unprivileged users can create entries.
-fn is_user_writable_location(p: &Path) -> bool {
-    ["/home/", "/tmp/", "/var/tmp/", "/dev/shm/", "/var/spool/", "/run/user/"].iter().any(|d| p.starts_with(d))
+fn fd_stat(fd: libc::c_int) -> Option<libc::stat> {
+    // SAFETY: zeroed stat is a valid out-buffer; fd is open.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    (unsafe { libc::fstat(fd, &mut st) } == 0).then_some(st)
+}
+
+fn enter_dir(area: Area, st: &libc::stat) -> Area {
+    if st.st_uid != 0 {
+        Area::User { owner: Some(st.st_uid) }
+    } else if st.st_mode & 0o022 != 0 {
+        match area {
+            Area::User { owner } => Area::User { owner },
+            Area::Trusted => Area::User { owner: None },
+        }
+    } else {
+        area
+    }
+}
+
+/// Read an autostart/config file safely while running as root.
+///
+/// Many of these files live where unprivileged users can create entries
+/// (home directories of any path, spool dirs, /tmp). A user could plant a
+/// symlink or hard link there — or make a *directory* such as `~/.ssh` a
+/// symlink — pointing at a secret (e.g. `/etc/shadow`) and have root copy its
+/// lines into a report. So the path is resolved one component at a time from
+/// `/` with `openat(O_NOFOLLOW)` (no check-then-use race), and trust comes
+/// from the actual ownership of each directory rather than a path list:
+///  * in root-only directories, a symlink is followed only if it is itself
+///    root-owned (systemd `.wants` links, merged-/usr links);
+///  * once inside a user-controlled or shared-writable directory, no symlink
+///    is ever followed, the file must have exactly one link, and it must be
+///    owned by that directory's owner or by root;
+///  * reads are capped at 1 MiB.
+pub(crate) fn read_config(path: &Path) -> Option<String> {
+    use std::ffi::CString;
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Component;
+    const MAX: i64 = 1 << 20;
+
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut names = Vec::new();
+    for c in path.components() {
+        match c {
+            Component::RootDir => {}
+            Component::Normal(n) => names.push(CString::new(n.as_bytes()).ok()?),
+            _ => return None, // `..` / `.` never appear in enumerated paths
+        }
+    }
+    let last = names.len().checked_sub(1)?;
+    let open_at = |dir: libc::c_int, name: &CString, flags: libc::c_int| -> Option<OwnedFd> {
+        // SAFETY: name is NUL-terminated; a successful fd is owned by OwnedFd.
+        let fd = unsafe { libc::openat(dir, name.as_ptr(), flags | libc::O_CLOEXEC) };
+        (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) })
+    };
+
+    // SAFETY: literal is NUL-terminated.
+    let root = unsafe { libc::open(c"/".as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+    if root < 0 {
+        return None;
+    }
+    // SAFETY: freshly opened fd.
+    let mut dir = unsafe { OwnedFd::from_raw_fd(root) };
+    let mut area = enter_dir(Area::Trusted, &fd_stat(dir.as_raw_fd())?);
+    let mut parent_owner: Option<u32> = None;
+
+    for (i, name) in names.iter().enumerate() {
+        let is_last = i == last;
+        let base = if is_last { libc::O_RDONLY | libc::O_NONBLOCK } else { libc::O_RDONLY | libc::O_DIRECTORY };
+        let fd = match open_at(dir.as_raw_fd(), name, base | libc::O_NOFOLLOW) {
+            Some(fd) => fd,
+            None => {
+                // Was it a symlink? Only follow root-owned links in trusted dirs.
+                // SAFETY: zeroed stat is a valid out-buffer.
+                let mut lst: libc::stat = unsafe { std::mem::zeroed() };
+                let is_link = unsafe { libc::fstatat(dir.as_raw_fd(), name.as_ptr(), &mut lst, libc::AT_SYMLINK_NOFOLLOW) } == 0
+                    && (lst.st_mode & libc::S_IFMT) == libc::S_IFLNK;
+                if !is_link || area != Area::Trusted || lst.st_uid != 0 {
+                    return None;
+                }
+                open_at(dir.as_raw_fd(), name, base)?
+            }
+        };
+        let st = fd_stat(fd.as_raw_fd())?;
+        if is_last {
+            if (st.st_mode & libc::S_IFMT) != libc::S_IFREG || st.st_size > MAX {
+                return None;
+            }
+            if let Area::User { .. } = area {
+                if st.st_nlink != 1 {
+                    return None; // hard link to a file elsewhere
+                }
+                if let Some(owner) = parent_owner {
+                    if st.st_uid != owner && st.st_uid != 0 {
+                        return None;
+                    }
+                }
+            }
+            let mut s = String::new();
+            fs::File::from(fd).take(MAX as u64).read_to_string(&mut s).ok()?;
+            return Some(s);
+        }
+        area = enter_dir(area, &st);
+        parent_owner = (st.st_uid != 0).then_some(st.st_uid).or(match area {
+            Area::User { owner } => owner,
+            Area::Trusted => None,
+        });
+        dir = fd;
+    }
+    None
 }
 
 fn read_trim(path: &str) -> Option<String> {
@@ -1414,14 +1488,57 @@ mod tests {
             fs::hard_link(&secret, &hard).unwrap();
             assert_eq!(read_config(&hard), None);
         }
-        // A directory symlink escaping the user-writable root is refused.
-        let outside = tempfile::Builder::new().tempdir_in("/var").unwrap_or_else(|_| tempfile::tempdir().unwrap());
+        // A directory symlink inside a shared-writable area is never traversed,
+        // wherever it points.
+        let outside = tempfile::tempdir().unwrap();
         fs::write(outside.path().join("k"), "secret").unwrap();
         let via = dir.path().join("ssh");
         symlink(outside.path(), &via).unwrap();
-        if !outside.path().starts_with("/tmp") {
-            assert_eq!(read_config(&via.join("k")), None);
+        assert_eq!(read_config(&via.join("k")), None);
+        // Relative paths and `..` are rejected outright.
+        assert_eq!(read_config(Path::new("etc/passwd")), None);
+        assert_eq!(read_config(&dir.path().join("../etc/passwd")), None);
+    }
+
+    #[test]
+    fn read_config_enforces_home_ownership() {
+        use std::os::unix::fs::symlink;
+        if unsafe { libc::geteuid() } != 0 {
+            return; // needs chown
         }
+        let chown = |p: &Path, uid: u32| {
+            let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
+            assert_eq!(unsafe { libc::lchown(c.as_ptr(), uid, uid) }, 0);
+        };
+        // A "home" owned by uid 1000 outside any well-known prefix (e.g. a
+        // service account under /var/lib): trust must come from ownership.
+        let base = tempfile::tempdir().unwrap();
+        let home = base.path().join("svc");
+        fs::create_dir(&home).unwrap();
+        chown(&home, 1000);
+        let own = home.join(".bashrc");
+        fs::write(&own, "ok").unwrap();
+        chown(&own, 1000);
+        assert_eq!(read_config(&own).as_deref(), Some("ok"));
+        // A file owned by a different unprivileged user is refused.
+        let foreign = home.join(".profile");
+        fs::write(&foreign, "x").unwrap();
+        chown(&foreign, 1001);
+        assert_eq!(read_config(&foreign), None);
+        // A user-owned hard link (nlink 2) is refused even if owned by the user.
+        let twin = home.join(".zshrc");
+        fs::hard_link(&own, &twin).unwrap();
+        assert_eq!(read_config(&own), None);
+        // Root-owned symlinks in root-only directories are still followed
+        // (systemd `.wants` links, merged-/usr).
+        // (Must be a root-only path: under /tmp the link is correctly refused.)
+        let Ok(sys) = tempfile::Builder::new().tempdir_in("/var/lib") else { return };
+        fs::write(sys.path().join("unit.service"), "[Service]").unwrap();
+        symlink(sys.path().join("unit.service"), sys.path().join("link.service")).unwrap();
+        assert_eq!(read_config(&sys.path().join("link.service")).as_deref(), Some("[Service]"));
+        // ...but the same link inside /tmp is not.
+        symlink(sys.path().join("unit.service"), base.path().join("link.service")).unwrap();
+        assert_eq!(read_config(&base.path().join("link.service")), None);
     }
 
     #[test]
