@@ -1109,28 +1109,39 @@ fn enter_dir(area: Area, st: &libc::stat) -> Area {
 ///    owned by that directory's owner or by root;
 ///  * reads are capped at 1 MiB.
 pub(crate) fn read_config(path: &Path) -> Option<String> {
+    use std::collections::VecDeque;
     use std::ffi::CString;
     use std::io::Read;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
     use std::path::Component;
     const MAX: i64 = 1 << 20;
+    const MAX_LINKS: usize = 40;
+
+    /// One directory in the physical path walked so far.
+    struct Level {
+        fd: OwnedFd,
+        area: Area,
+        /// Owner a file in this directory must have (besides root), if any.
+        owner: Option<u32>,
+    }
 
     if !path.is_absolute() {
         return None;
     }
-    let mut names = Vec::new();
+    // Remaining components to resolve. Symlink targets are spliced in here,
+    // so the kernel never resolves a link on our behalf.
+    let mut queue: VecDeque<Vec<u8>> = VecDeque::new();
     for c in path.components() {
         match c {
             Component::RootDir => {}
-            Component::Normal(n) => names.push(CString::new(n.as_bytes()).ok()?),
+            Component::Normal(n) => queue.push_back(n.as_bytes().to_vec()),
             _ => return None, // `..` / `.` never appear in enumerated paths
         }
     }
-    let last = names.len().checked_sub(1)?;
     let open_at = |dir: libc::c_int, name: &CString, flags: libc::c_int| -> Option<OwnedFd> {
         // SAFETY: name is NUL-terminated; a successful fd is owned by OwnedFd.
-        let fd = unsafe { libc::openat(dir, name.as_ptr(), flags | libc::O_CLOEXEC) };
+        let fd = unsafe { libc::openat(dir, name.as_ptr(), flags | libc::O_CLOEXEC | libc::O_NOFOLLOW) };
         (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) })
     };
 
@@ -1140,37 +1151,66 @@ pub(crate) fn read_config(path: &Path) -> Option<String> {
         return None;
     }
     // SAFETY: freshly opened fd.
-    let mut dir = unsafe { OwnedFd::from_raw_fd(root) };
-    let mut area = enter_dir(Area::Trusted, &fd_stat(dir.as_raw_fd())?);
-    let mut parent_owner: Option<u32> = None;
+    let root = unsafe { OwnedFd::from_raw_fd(root) };
+    let root_area = enter_dir(Area::Trusted, &fd_stat(root.as_raw_fd())?);
+    // The physical directory chain; `..` pops it, so trust is always that of
+    // the directories actually traversed.
+    let mut stack = vec![Level { fd: root, area: root_area, owner: None }];
+    let mut links = 0usize;
 
-    for (i, name) in names.iter().enumerate() {
-        let is_last = i == last;
-        let base = if is_last { libc::O_RDONLY | libc::O_NONBLOCK } else { libc::O_RDONLY | libc::O_DIRECTORY };
-        let fd = match open_at(dir.as_raw_fd(), name, base | libc::O_NOFOLLOW) {
-            Some(fd) => fd,
-            None => {
-                // Was it a symlink? Only follow root-owned links in trusted dirs.
-                // SAFETY: zeroed stat is a valid out-buffer.
-                let mut lst: libc::stat = unsafe { std::mem::zeroed() };
-                let is_link = unsafe { libc::fstatat(dir.as_raw_fd(), name.as_ptr(), &mut lst, libc::AT_SYMLINK_NOFOLLOW) } == 0
-                    && (lst.st_mode & libc::S_IFMT) == libc::S_IFLNK;
-                if !is_link || area != Area::Trusted || lst.st_uid != 0 {
-                    return None;
-                }
-                open_at(dir.as_raw_fd(), name, base)?
+    while let Some(name) = queue.pop_front() {
+        if name.is_empty() || name == b"." {
+            continue;
+        }
+        if name == b".." {
+            if stack.len() > 1 {
+                stack.pop();
             }
+            continue;
+        }
+        let is_last = queue.is_empty();
+        let cname = CString::new(name).ok()?;
+        let cur = stack.last()?;
+        let flags = if is_last { libc::O_RDONLY | libc::O_NONBLOCK } else { libc::O_RDONLY | libc::O_DIRECTORY };
+        let Some(fd) = open_at(cur.fd.as_raw_fd(), &cname, flags) else {
+            // Was it a symlink? Only root-owned links in trusted directories are
+            // followed, and their targets are walked through this same loop.
+            // SAFETY: zeroed stat is a valid out-buffer.
+            let mut lst: libc::stat = unsafe { std::mem::zeroed() };
+            let is_link = unsafe { libc::fstatat(cur.fd.as_raw_fd(), cname.as_ptr(), &mut lst, libc::AT_SYMLINK_NOFOLLOW) } == 0
+                && (lst.st_mode & libc::S_IFMT) == libc::S_IFLNK;
+            if !is_link || cur.area != Area::Trusted || lst.st_uid != 0 {
+                return None;
+            }
+            links += 1;
+            if links > MAX_LINKS {
+                return None;
+            }
+            let mut buf = vec![0u8; 4096];
+            // SAFETY: buf is valid for buf.len() bytes; name is NUL-terminated.
+            let n = unsafe { libc::readlinkat(cur.fd.as_raw_fd(), cname.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+            if n <= 0 || n as usize >= buf.len() {
+                return None;
+            }
+            buf.truncate(n as usize);
+            if buf.first() == Some(&b'/') {
+                stack.truncate(1); // absolute target: restart from /
+            }
+            for part in buf.split(|b| *b == b'/').rev() {
+                queue.push_front(part.to_vec());
+            }
+            continue;
         };
         let st = fd_stat(fd.as_raw_fd())?;
         if is_last {
             if (st.st_mode & libc::S_IFMT) != libc::S_IFREG || st.st_size > MAX {
                 return None;
             }
-            if let Area::User { .. } = area {
+            if let Area::User { .. } = cur.area {
                 if st.st_nlink != 1 {
                     return None; // hard link to a file elsewhere
                 }
-                if let Some(owner) = parent_owner {
+                if let Some(owner) = cur.owner {
                     if st.st_uid != owner && st.st_uid != 0 {
                         return None;
                     }
@@ -1180,12 +1220,12 @@ pub(crate) fn read_config(path: &Path) -> Option<String> {
             fs::File::from(fd).take(MAX as u64).read_to_string(&mut s).ok()?;
             return Some(s);
         }
-        area = enter_dir(area, &st);
-        parent_owner = (st.st_uid != 0).then_some(st.st_uid).or(match area {
+        let area = enter_dir(cur.area, &st);
+        let owner = (st.st_uid != 0).then_some(st.st_uid).or(match area {
             Area::User { owner } => owner,
             Area::Trusted => None,
         });
-        dir = fd;
+        stack.push(Level { fd, area, owner });
     }
     None
 }
@@ -1539,6 +1579,30 @@ mod tests {
         // ...but the same link inside /tmp is not.
         symlink(sys.path().join("unit.service"), base.path().join("link.service")).unwrap();
         assert_eq!(read_config(&base.path().join("link.service")), None);
+
+        // A root-owned link in a trusted dir whose target runs through a
+        // user's home must re-apply the user-area rules to that target.
+        let secret = sys.path().join("shadow");
+        fs::write(&secret, "root-secret").unwrap();
+        let planted = home.join("evil.conf");
+        symlink(&secret, &planted).unwrap(); // user-planted link inside their home
+        chown(&planted, 1000);
+        symlink(&planted, sys.path().join("via-home.service")).unwrap();
+        assert_eq!(read_config(&sys.path().join("via-home.service")), None);
+        // A root-owned link to a genuine user-owned file is still followed.
+        let real = home.join("real.conf");
+        fs::write(&real, "user-config").unwrap();
+        chown(&real, 1000);
+        symlink(&real, sys.path().join("to-real.service")).unwrap();
+        assert_eq!(read_config(&sys.path().join("to-real.service")).as_deref(), Some("user-config"));
+        // Relative targets with `..` (systemd .wants style) resolve physically.
+        fs::create_dir(sys.path().join("wants")).unwrap();
+        symlink("../unit.service", sys.path().join("wants/unit.service")).unwrap();
+        assert_eq!(read_config(&sys.path().join("wants/unit.service")).as_deref(), Some("[Service]"));
+        // Link loops terminate.
+        symlink(sys.path().join("loop-b"), sys.path().join("loop-a")).unwrap();
+        symlink(sys.path().join("loop-a"), sys.path().join("loop-b")).unwrap();
+        assert_eq!(read_config(&sys.path().join("loop-a")), None);
     }
 
     #[test]
