@@ -64,18 +64,61 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
       - run: npm ci
       - run: npm run build
-      - name: Checksums
+      - name: Collect release files
         shell: bash
         run: |
-          cd target/release/bundle
-          find . -type f \( -name '*.msi' -o -name '*.exe' -o -name '*.deb' -o -name '*.AppImage' \) -exec sha256sum {} \; > SHA256SUMS-${{ runner.os }}.txt
-          cat SHA256SUMS-${{ runner.os }}.txt
+          mkdir -p dist-release
+          find target/release/bundle -type f \( -name '*.msi' -o -name '*-setup.exe' -o -name '*.deb' -o -name '*.AppImage' \) -exec cp {} dist-release/ \;
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cp target/release/panoptic-cli.exe dist-release/panoptic-cli-${GITHUB_REF_NAME}-windows-x64.exe
+          else
+            cp target/release/panoptic-cli dist-release/panoptic-cli-${GITHUB_REF_NAME}-linux-x64
+          fi
+          ls -la dist-release
       - uses: actions/upload-artifact@v4
         with:
           name: panoptic-${{ runner.os }}
-          path: |
-            target/release/bundle/**/*.msi
-            target/release/bundle/**/*.exe
-            target/release/bundle/**/*.deb
-            target/release/bundle/**/*.AppImage
-            target/release/bundle/SHA256SUMS-*.txt
+          path: dist-release/*
+          if-no-files-found: error
+
+  release:
+    needs: bundle
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          cd assets
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Release notes from CHANGELOG
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '
+            $0 ~ "^## \\[" v "\\]" { found=1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          {
+            echo
+            echo "### Downloads"
+            echo "- **Windows:** \`.msi\` or \`-setup.exe\` (WebView2 embedded, installs offline)"
+            echo "- **Linux:** \`.deb\` or \`.AppImage\`"
+            echo "- **Headless CLI:** \`panoptic-cli-*\` for servers, cron and CI"
+            echo
+            echo "Verify downloads with \`SHA256SUMS.txt\`. Licensed under AGPL-3.0-only."
+          } >> notes.md
+          cat notes.md
+      - uses: softprops/action-gh-release@v2.0.8
+        with:
+          name: Panoptic ${{ github.ref_name }}
+          body_path: notes.md
+          files: assets/*
+          fail_on_unmatched_files: true
