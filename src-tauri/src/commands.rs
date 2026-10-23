@@ -13,8 +13,8 @@ use tauri::{command, AppHandle, Emitter, State};
 pub struct AppState(pub Arc<Workspace>);
 
 impl AppState {
-    pub fn new(data_dir: PathBuf) -> Self {
-        AppState(Workspace::new(data_dir, cli_path()))
+    pub fn new(data_dir: PathBuf) -> Result<Self, String> {
+        Ok(AppState(Workspace::new(data_dir, cli_path())?))
     }
 }
 
@@ -153,6 +153,6 @@ pub fn relaunch_as_admin(app: AppHandle) -> Result<(), String> {
     #[cfg(not(target_os = "windows"))]
     {
         let _ = app;
-        Err("Restart Panoptic with sudo (e.g. `sudo -E panoptic`) or via pkexec to grant root privileges.".into())
+        Err("Restart Panoptic as root (for example `sudo panoptic` or via pkexec) to grant full privileges.".into())
     }
 }

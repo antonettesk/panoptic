@@ -1698,6 +1698,12 @@ fn xml_unescape(s: &str) -> String {
 /// Best-effort .lnk target extraction (LinkInfo local base path, else the
 /// first absolute path-looking string in the file).
 fn lnk_target(p: &Path) -> Option<String> {
+    // Shortcuts are attacker-controllable: cap the read and bounds-check
+    // every offset taken from the file so a crafted .lnk cannot panic the scan.
+    const MAX_LNK: u64 = 1 << 20;
+    if std::fs::metadata(p).ok()?.len() > MAX_LNK {
+        return None;
+    }
     let b = std::fs::read(p).ok()?;
     if b.len() < 0x4C || rd_u32(&b, 0) != 0x4C {
         return None;
@@ -1707,15 +1713,16 @@ fn lnk_target(p: &Path) -> Option<String> {
     if flags & 0x1 != 0 {
         // LinkTargetIDList present
         let len = u16::from_le_bytes([*b.get(off)?, *b.get(off + 1)?]) as usize;
-        off += 2 + len;
+        off = off.checked_add(2 + len)?;
     }
-    if flags & 0x2 != 0 && off + 0x1C <= b.len() {
+    if flags & 0x2 != 0 && off.checked_add(0x1C).is_some_and(|end| end <= b.len()) {
         let info_start = off;
         let local_base_off = rd_u32(&b, info_start + 0x10) as usize;
         if local_base_off != 0 {
-            let s = info_start + local_base_off;
-            let end = b[s..].iter().position(|c| *c == 0)? + s;
-            let path = String::from_utf8_lossy(&b[s..end]).into_owned();
+            let s = info_start.checked_add(local_base_off)?;
+            let tail = b.get(s..)?;
+            let len = tail.iter().position(|c| *c == 0)?;
+            let path = String::from_utf8_lossy(&tail[..len]).into_owned();
             if !path.is_empty() {
                 return Some(path);
             }
@@ -1784,6 +1791,22 @@ mod tests {
         assert_eq!(e.normalize_path("\\??\\C:\\evil\\r.sys"), "C:\\evil\\r.sys");
         assert_eq!(e.normalize_path("System32\\drivers\\y.sys"), format!("{sr}\\System32\\drivers\\y.sys"));
         assert_eq!(e.normalize_path("%SystemRoot%\\notepad.exe"), format!("{sr}\\notepad.exe"));
+    }
+
+    #[test]
+    fn crafted_lnk_never_panics() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("evil.lnk");
+        let mut b = vec![0u8; 0x4C + 0x20];
+        b[0..4].copy_from_slice(&0x4Cu32.to_le_bytes());
+        b[0x14..0x18].copy_from_slice(&0x2u32.to_le_bytes()); // HasLinkInfo, no IDList
+        b[0x4C + 0x10..0x4C + 0x14].copy_from_slice(&0xFFFF_FFF0u32.to_le_bytes()); // offset far past EOF
+        std::fs::write(&p, &b).unwrap();
+        assert_eq!(lnk_target(&p), None);
+        b[0x14..0x18].copy_from_slice(&0x3u32.to_le_bytes()); // IDList length pointing past EOF
+        b[0x4C..0x4E].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        std::fs::write(&p, &b).unwrap();
+        let _ = lnk_target(&p);
     }
 
     #[test]

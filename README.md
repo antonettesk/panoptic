@@ -77,7 +77,7 @@ Download an installer for your platform from the [releases page](../../releases)
 - **Windows**: `Panoptic_x64-setup.exe` or `Panoptic_x64_en-US.msi`
 - **Linux**: `panoptic_amd64.deb` or `panoptic_amd64.AppImage`
 
-Launch Panoptic and follow the onboarding. For full kernel-level coverage, run it as Administrator (Windows) or with `sudo -E panoptic` (Linux).
+Launch Panoptic and follow the onboarding. For full kernel-level coverage, run it as Administrator (Windows) or with `sudo panoptic` (Linux). When running as root, Panoptic keeps its data in the root-owned `/var/lib/panoptic`.
 
 ### Build from source
 

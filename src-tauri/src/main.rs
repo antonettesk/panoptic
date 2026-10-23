@@ -11,9 +11,11 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            let data_dir = app.path().app_data_dir().unwrap_or_else(|_| std::env::temp_dir().join("panoptic"));
-            std::fs::create_dir_all(&data_dir).ok();
-            app.manage(AppState::new(data_dir));
+            // Same location as Tauri's app_data_dir for normal users; a
+            // root-owned directory when elevated on Linux (never a
+            // user-controlled $HOME). Unsafe directories abort startup.
+            let data_dir = panoptic_core::workspace::default_data_dir();
+            app.manage(AppState::new(data_dir)?);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

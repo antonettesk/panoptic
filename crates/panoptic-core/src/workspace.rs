@@ -65,8 +65,21 @@ pub struct Rendered {
     pub extension: &'static str,
 }
 
-/// Platform data directory, identical to Tauri's `app_data_dir()`.
+/// Root-owned data directory used whenever Panoptic runs as root on Linux.
+pub const ROOT_DATA_DIR: &str = "/var/lib/panoptic";
+
+/// Platform data directory (matches Tauri's `app_data_dir()` for normal users).
+///
+/// When running as root on Linux, `$HOME`/`$XDG_DATA_HOME` may still point at
+/// an unprivileged user's directory (e.g. under `sudo -E`). Writing there as
+/// root would let that user redirect our writes with symlinks, so root always
+/// uses a root-owned directory instead.
 pub fn default_data_dir() -> PathBuf {
+    #[cfg(target_os = "linux")]
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        return PathBuf::from(ROOT_DATA_DIR);
+    }
     #[cfg(windows)]
     let base = std::env::var_os("APPDATA").map(PathBuf::from);
     #[cfg(not(windows))]
@@ -75,6 +88,35 @@ pub fn default_data_dir() -> PathBuf {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")));
     base.unwrap_or_else(std::env::temp_dir).join(APP_IDENTIFIER)
+}
+
+/// Create (if needed) and validate the data directory: it must be a real
+/// directory, not a symlink, owned by the effective user and private (0700)
+/// on Unix. Refuses rather than writing into a directory someone else controls.
+pub fn ensure_private_dir(dir: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(m) if m.file_type().is_symlink() => return Err(format!("refusing to use data directory {}: it is a symlink", dir.display())),
+        Ok(m) if !m.is_dir() => return Err(format!("data directory {} is not a directory", dir.display())),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(dir).map_err(|e| format!("could not create data directory {}: {e}", dir.display()))?;
+        }
+        Err(e) => return Err(format!("could not inspect data directory {}: {e}", dir.display())),
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let m = std::fs::symlink_metadata(dir).map_err(|e| e.to_string())?;
+        // SAFETY: geteuid has no preconditions.
+        let euid = unsafe { libc::geteuid() };
+        if m.uid() != euid {
+            return Err(format!("refusing to use data directory {}: owned by uid {}, not {euid}", dir.display(), m.uid()));
+        }
+        if m.permissions().mode() & 0o077 != 0 {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 pub fn valid_scan_id(id: &str) -> bool {
@@ -99,9 +141,10 @@ pub struct Workspace {
 }
 
 impl Workspace {
-    pub fn new(data_dir: PathBuf, cli_path: Option<PathBuf>) -> Arc<Self> {
-        let _ = std::fs::create_dir_all(&data_dir);
-        Arc::new(Workspace {
+    /// Fails if the data directory is unsafe to write to (see `ensure_private_dir`).
+    pub fn new(data_dir: PathBuf, cli_path: Option<PathBuf>) -> Result<Arc<Self>, String> {
+        ensure_private_dir(&data_dir)?;
+        Ok(Arc::new(Workspace {
             scanner: Scanner::new(),
             cancel: CancelToken::new(),
             scanning: AtomicBool::new(false),
@@ -109,7 +152,7 @@ impl Workspace {
             progress: Mutex::new(None),
             data_dir,
             cli_path,
-        })
+        }))
     }
 
     pub fn data_dir(&self) -> &Path {
@@ -488,7 +531,7 @@ mod tests {
 
     fn ws() -> (tempfile::TempDir, Arc<Workspace>) {
         let d = tempfile::tempdir().unwrap();
-        let w = Workspace::new(d.path().to_path_buf(), None);
+        let w = Workspace::new(d.path().to_path_buf(), None).unwrap();
         (d, w)
     }
 
@@ -526,7 +569,30 @@ mod tests {
     }
 
     #[test]
-    fn data_dir_matches_tauri_identifier() {
-        assert!(default_data_dir().ends_with(APP_IDENTIFIER));
+    fn data_dir_matches_tauri_identifier_or_root_dir() {
+        let d = default_data_dir();
+        #[cfg(target_os = "linux")]
+        if unsafe { libc::geteuid() } == 0 {
+            assert_eq!(d, PathBuf::from(ROOT_DATA_DIR));
+            return;
+        }
+        assert!(d.ends_with(APP_IDENTIFIER));
+    }
+
+    #[test]
+    fn refuses_symlinked_data_dir() {
+        let d = tempfile::tempdir().unwrap();
+        let real = d.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = d.path().join("link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        #[cfg(windows)]
+        if std::os::windows::fs::symlink_dir(&real, &link).is_err() {
+            return; // creating symlinks needs Developer Mode / admin on Windows
+        }
+        assert!(ensure_private_dir(&link).unwrap_err().contains("symlink"));
+        assert!(ensure_private_dir(&real).is_ok());
+        assert!(ensure_private_dir(&d.path().join("new/nested")).is_ok());
     }
 }

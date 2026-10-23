@@ -317,7 +317,7 @@ impl TruthEngine for LinuxEngine {
         }
 
         // --- loader
-        if let Ok(c) = fs::read_to_string("/etc/ld.so.preload") {
+        if let Some(c) = read_config(Path::new("/etc/ld.so.preload")) {
             for lib in c.split_whitespace().filter(|l| !l.starts_with('#')) {
                 out.push(PersistenceEntry {
                     mechanism: "ld.so.preload".into(),
@@ -343,7 +343,7 @@ impl TruthEngine for LinuxEngine {
         // --- SSH authorized_keys
         for h in &homes {
             let f = h.join(".ssh/authorized_keys");
-            if let Ok(c) = fs::read_to_string(&f) {
+            if let Some(c) = read_config(&f) {
                 for line in c.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
                     let mut reasons = Vec::new();
                     let mut risk = Severity::Info;
@@ -372,7 +372,7 @@ impl TruthEngine for LinuxEngine {
 
         // --- udev, motd, modules-load, PAM
         for f in list_files("/etc/udev/rules.d") {
-            if let Ok(c) = fs::read_to_string(&f) {
+            if let Some(c) = read_config(&f) {
                 for line in c.lines().filter(|l| l.contains("RUN+=") || l.contains("RUN=") || l.contains("PROGRAM=")) {
                     let mut ind = analyze_command(line);
                     for p in extract_paths(line) {
@@ -386,7 +386,7 @@ impl TruthEngine for LinuxEngine {
             script_scan_only(&f, "motd", &mut out);
         }
         for f in std::iter::once(PathBuf::from("/etc/modules")).chain(list_files("/etc/modules-load.d")) {
-            if let Ok(c) = fs::read_to_string(&f) {
+            if let Some(c) = read_config(&f) {
                 for m in c.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
                     out.push(PersistenceEntry {
                         mechanism: "kernel-module-autoload".into(),
@@ -401,7 +401,7 @@ impl TruthEngine for LinuxEngine {
             }
         }
         for f in list_files("/etc/pam.d") {
-            if let Ok(c) = fs::read_to_string(&f) {
+            if let Some(c) = read_config(&f) {
                 for line in c.lines().map(str::trim).filter(|l| !l.starts_with('#')) {
                     let mut ind: Vec<Indicator> = Vec::new();
                     if line.contains("pam_exec.so") {
@@ -653,7 +653,7 @@ impl TruthEngine for LinuxEngine {
 
     fn integrity_checks(&self) -> Vec<Finding> {
         let mut out = Vec::new();
-        if let Ok(c) = fs::read_to_string("/etc/ld.so.preload") {
+        if let Some(c) = read_config(Path::new("/etc/ld.so.preload")) {
             let libs: Vec<&str> = c.split_whitespace().filter(|l| !l.starts_with('#')).collect();
             if !libs.is_empty() {
                 out.push(
@@ -1064,6 +1064,58 @@ pub(crate) fn suspicious_mappings(maps: &str) -> Vec<String> {
 // ---------------------------------------------------------------------------
 // Persistence helpers
 
+/// Read an autostart/config file safely while running as root.
+///
+/// Many of these files live in user-writable places (home directories,
+/// spool dirs). A user could plant a symlink or hard link there pointing at
+/// a secret (e.g. `/etc/shadow`) and have root copy its lines into a report.
+/// So:
+///  * the file is opened with `O_NOFOLLOW` (no TOCTOU between check and read);
+///  * a symlink is followed only when the link itself is root-owned — users
+///    cannot create those, while systemd/etc use them legitimately;
+///  * a root-owned regular file with extra hard links is refused;
+///  * reads are capped at 1 MiB.
+pub(crate) fn read_config(path: &Path) -> Option<String> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    const MAX: u64 = 1 << 20;
+    // A directory symlink earlier in the path (e.g. ~/.ssh -> /root/.ssh)
+    // would escape the user's area even though the final component is a
+    // regular file. Require the fully resolved path to stay inside the
+    // user-writable root it was enumerated from (e.g. /home/alice).
+    if is_user_writable_location(path) {
+        let anchor: PathBuf = path.components().take(if path.starts_with("/home/") || path.starts_with("/run/user/") { 3 } else { 2 }).collect();
+        let resolved = fs::canonicalize(path).ok()?;
+        if !resolved.starts_with(&anchor) {
+            return None;
+        }
+    }
+    let open_nofollow = |p: &Path| fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(p);
+    let file = match open_nofollow(path) {
+        Ok(f) => f,
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+            let link = fs::symlink_metadata(path).ok()?;
+            if link.uid() != 0 {
+                return None; // user-planted symlink: never follow as root
+            }
+            fs::File::open(path).ok()?
+        }
+        Err(_) => return None,
+    };
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.len() > MAX || (meta.uid() == 0 && meta.nlink() > 1 && is_user_writable_location(path)) {
+        return None;
+    }
+    let mut s = String::new();
+    file.take(MAX).read_to_string(&mut s).ok()?;
+    Some(s)
+}
+
+/// Locations where unprivileged users can create entries.
+fn is_user_writable_location(p: &Path) -> bool {
+    ["/home/", "/tmp/", "/var/tmp/", "/dev/shm/", "/var/spool/", "/run/user/"].iter().any(|d| p.starts_with(d))
+}
+
 fn read_trim(path: &str) -> Option<String> {
     fs::read_to_string(path).ok().map(|s| s.trim().to_string())
 }
@@ -1179,7 +1231,7 @@ fn line_indicators(line: &str) -> Vec<Indicator> {
 
 /// Crontab: every schedule line is an entry; `system` crontabs carry a user column.
 fn cron_file(path: &Path, mech: &str, system: bool, out: &mut Vec<PersistenceEntry>) {
-    let Ok(c) = fs::read_to_string(path) else { return };
+    let Some(c) = read_config(path) else { return };
     for line in c.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
         let first = line.split_whitespace().next().unwrap_or("");
         if first.contains('=') && !first.starts_with('@') {
@@ -1196,7 +1248,7 @@ fn cron_file(path: &Path, mech: &str, system: bool, out: &mut Vec<PersistenceEnt
 
 /// A script that *is* the persistence (cron.daily, rc.local, at job): always listed.
 fn script_file(path: &Path, mech: &str, out: &mut Vec<PersistenceEntry>) {
-    let Ok(c) = fs::read_to_string(path) else { return };
+    let Some(c) = read_config(path) else { return };
     let mut ind: Vec<Indicator> = Vec::new();
     for line in c.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
         for i in line_indicators(line) {
@@ -1220,7 +1272,7 @@ fn script_file(path: &Path, mech: &str, out: &mut Vec<PersistenceEntry>) {
 
 /// Files that are normally benign (shell rc, init.d): only listed when a line is suspicious.
 fn script_scan_only(path: &Path, mech: &str, out: &mut Vec<PersistenceEntry>) {
-    let Ok(c) = fs::read_to_string(path) else { return };
+    let Some(c) = read_config(path) else { return };
     for line in c.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
         let ind = line_indicators(line);
         if max_severity(&ind) >= Severity::Medium {
@@ -1238,7 +1290,7 @@ fn systemd_unit(path: &Path, vendor: bool, out: &mut Vec<PersistenceEntry>) {
     if fs::read_link(path).map(|t| t == Path::new("/dev/null")).unwrap_or(false) {
         return;
     }
-    let Ok(c) = fs::read_to_string(path) else { return };
+    let Some(c) = read_config(path) else { return };
     let execs: Vec<&str> = c
         .lines()
         .map(str::trim)
@@ -1259,7 +1311,7 @@ fn systemd_unit(path: &Path, vendor: bool, out: &mut Vec<PersistenceEntry>) {
 }
 
 fn desktop_entry(path: &Path, out: &mut Vec<PersistenceEntry>) {
-    let Ok(c) = fs::read_to_string(path) else { return };
+    let Some(c) = read_config(path) else { return };
     if let Some(exec) = c.lines().find_map(|l| l.trim().strip_prefix("Exec=")) {
         let hidden = c.lines().any(|l| l.trim() == "Hidden=true" || l.trim() == "NoDisplay=true");
         let mut ind = line_indicators(exec);
@@ -1340,6 +1392,36 @@ mod tests {
         assert!(line_indicators("if [ -d \"/tmp/$ICE_DIR\" ]; then").is_empty());
         assert!(!line_indicators("nohup /tmp/.x/miner -o pool").is_empty());
         assert!(!line_indicators("/dev/shm/payload").is_empty());
+    }
+
+    #[test]
+    fn read_config_refuses_planted_links() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
+        let secret = dir.path().join("secret");
+        fs::write(&secret, "root-only").unwrap();
+        // Regular file: readable.
+        assert_eq!(read_config(&secret).as_deref(), Some("root-only"));
+        // Symlink owned by an unprivileged user: never followed.
+        let link = dir.path().join("authorized_keys");
+        symlink(&secret, &link).unwrap();
+        if unsafe { libc::geteuid() } == 0 {
+            let c = std::ffi::CString::new(link.as_os_str().as_encoded_bytes()).unwrap();
+            assert_eq!(unsafe { libc::lchown(c.as_ptr(), 1000, 1000) }, 0);
+            assert_eq!(read_config(&link), None);
+            // Root-owned file with an extra hard link in a user-writable area: refused.
+            let hard = dir.path().join("hardlink");
+            fs::hard_link(&secret, &hard).unwrap();
+            assert_eq!(read_config(&hard), None);
+        }
+        // A directory symlink escaping the user-writable root is refused.
+        let outside = tempfile::Builder::new().tempdir_in("/var").unwrap_or_else(|_| tempfile::tempdir().unwrap());
+        fs::write(outside.path().join("k"), "secret").unwrap();
+        let via = dir.path().join("ssh");
+        symlink(outside.path(), &via).unwrap();
+        if !outside.path().starts_with("/tmp") {
+            assert_eq!(read_config(&via.join("k")), None);
+        }
     }
 
     #[test]
